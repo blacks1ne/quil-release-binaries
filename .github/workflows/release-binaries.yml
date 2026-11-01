@@ -172,7 +172,12 @@ jobs:
           git config user.email "q.blacks1ne@gmail.com"
           git add released.txt
           git commit -q -m "record release v$VERSION"
-          git push -q origin HEAD
+          # A notes commit can land on main while the builds run.
+          for i in 1 2 3 4 5; do
+            git push -q origin HEAD && break
+            [ "$i" = 5 ] && { echo "::error::could not push released.txt"; exit 1; }
+            git pull -q --rebase origin main
+          done
           gh release create "v$VERSION" assets/* --title "Node and qclient $VERSION" --notes-file body.md --latest --target "$(git rev-parse HEAD)"
 
   notes:
