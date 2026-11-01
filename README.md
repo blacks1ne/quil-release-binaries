@@ -4,7 +4,7 @@ Unofficial `node` and `qclient` binaries for each new Quilibrium release, publis
 
 ## How they are built
 
-Every 15 minutes a GitHub Actions workflow checks the `v2.1.0.25` release branch of [QuilibriumNetwork/monorepo](https://github.com/QuilibriumNetwork/monorepo). When a new `bump subpatch` commit appears, it builds `node` and `qclient` for linux-amd64 and darwin-arm64 from that exact commit with the project's own `node/build.sh`, checks each binary's `--version`, and publishes a release. Nothing is added to the source. Each release names its bump commit and links its workflow run; `released.txt` lists every published version.
+A GitHub Actions workflow checks the `v2.1.0.25` release branch of [QuilibriumNetwork/monorepo](https://github.com/QuilibriumNetwork/monorepo) every 15 minutes (GitHub runs scheduled workflows on a best-effort basis, so a build may start later) and also runs when a new bump lands. When a new `bump subpatch` commit appears, it builds `node` and `qclient` for linux-amd64 and darwin-arm64 from that exact commit with the project's own `node/build.sh`, checks each binary's `--version`, and publishes a release. Nothing is added to the source. Each release names its bump commit and links its workflow run; `released.txt` lists every published version.
 
 ## Verify before use
 
