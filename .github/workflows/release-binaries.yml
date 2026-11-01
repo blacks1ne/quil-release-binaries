@@ -1,0 +1,168 @@
+name: release-binaries
+
+# Every 15 minutes: find the newest upstream release-branch commit that
+# changes `subpatch` (the bump); if this repo has no release for its
+# version yet, build node and qclient at that commit with the project's
+# node/build.sh and publish them as the latest release.
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-binaries
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: QuilibriumNetwork/monorepo
+  UPSTREAM_BRANCH: v2.1.0.25
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.d.outputs.sha }}
+      version: ${{ steps.d.outputs.version }}
+      build: ${{ steps.d.outputs.build }}
+    steps:
+      - id: d
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&path=subpatch&per_page=1" --jq '.[0].sha')
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit changing subpatch on $UPSTREAM_BRANCH (got '$sha')"; exit 1; }
+          raw() { gh api -H 'Accept: application/vnd.github.raw' "repos/$UPSTREAM/contents/$1?ref=$sha"; }
+          sub=$(raw subpatch | tr -d '[:space:]')
+          base=$(raw crates/quil-config/src/version.rs | sed -n 's/^pub const VERSION_STRING: &str = "\(.*\)";/\1/p')
+          [[ "$sub" =~ ^[0-9]+$ && "$base" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::cannot parse version at $sha: base='$base' subpatch='$sub'"; exit 1; }
+          v="$base.$sub"
+          { echo "sha=$sha"; echo "version=$v"; } >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "v$v already released"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"; echo "new release v$v at $sha"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    name: ${{ matrix.bin }} (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [linux-amd64, darwin-arm64]
+        bin: [node, qclient]
+        include:
+          - name: linux-amd64
+            runs-on: ubuntu-latest
+            quil_platform: amd64_linux
+          - name: darwin-arm64
+            runs-on: macos-14
+            quil_platform: arm64_macos
+          - bin: node
+            crate: quil-node
+            bin_name: quil-node
+            out_base: node/build
+          - bin: qclient
+            crate: quil-client
+            bin_name: qclient
+            out_base: crates/quil-client/build
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.detect.outputs.sha }}
+          lfs: true
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: build release ${{ matrix.bin }} binary
+        env:
+          QUIL_PLATFORM: ${{ matrix.quil_platform }}
+          FLINT_DIR: ${{ runner.os == 'macOS' && steps.native-deps.outputs.flint-dir || '' }}
+          CRATE_NAME: ${{ matrix.crate }}
+          BIN_NAME: ${{ matrix.bin_name }}
+          OUT_BIN_NAME: ${{ matrix.bin }}
+          OUT_BASE_DIR: ${{ matrix.out_base }}
+        run: bash node/build.sh
+
+      - name: check and name the asset
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          f=${{ matrix.out_base }}/${{ matrix.quil_platform }}/${{ matrix.bin }}
+          file "$f"
+          if [ "$RUNNER_OS" = macOS ]; then otool -L "$f"; else ldd "$f" || true; fi
+          "$f" --version | tee version.txt
+          grep -qF "$VERSION" version.txt || { echo "::error::$f --version does not report $VERSION"; exit 1; }
+          a=${{ matrix.bin }}-$VERSION-${{ matrix.name }}
+          mkdir -p out && cp "$f" "out/$a"
+          cd out
+          if [ "$RUNNER_OS" = macOS ]; then shasum -a 256 "$a" > "$a.sha256"; else sha256sum "$a" > "$a.sha256"; fi
+          cat "$a.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin }}-${{ matrix.name }}
+          path: out/
+          retention-days: 7
+
+  release:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: verify assets
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd assets
+          for b in node qclient; do for p in linux-amd64 darwin-arm64; do
+            test -s "$b-$VERSION-$p" && test -s "$b-$VERSION-$p.sha256"
+          done; done
+          [ "$(ls | wc -l)" = 8 ] || { ls -l; echo "::error::expected 8 assets"; exit 1; }
+          sha256sum -c *.sha256
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          SHA: ${{ needs.detect.outputs.sha }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          sed -e "s|<version>|$VERSION|g" -e "s|<bump-sha>|${SHA:0:8}|g" -e "s|<run-url>|$run_url|g" release-body.md > body.md
+          cat body.md
+          echo "v$VERSION $SHA $(date -u +%FT%TZ)" >> released.txt
+          git config user.name "Black Swan"
+          git config user.email "q.blacks1ne@gmail.com"
+          git add released.txt
+          git commit -q -m "record release v$VERSION"
+          git push -q origin HEAD
+          gh release create "v$VERSION" assets/* --title "Node and qclient $VERSION" --notes-file body.md --latest --target "$(git rev-parse HEAD)"
