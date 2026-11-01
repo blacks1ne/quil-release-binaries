@@ -3,10 +3,15 @@ name: release-binaries
 # Every 15 minutes: find the newest upstream release-branch commit that
 # changes `subpatch` (the bump); if this repo has no release for its
 # version yet, build node and qclient at that commit with the project's
-# node/build.sh and publish them as the latest release.
+# node/build.sh and publish them as the latest release. notes/<version>.md,
+# when present, is appended to that version's release (at publication, or
+# by the notes job once it lands).
 on:
   schedule:
     - cron: '*/15 * * * *'
+  push:
+    branches: [main]
+    paths: ['notes/**']
   workflow_dispatch: {}
 
 permissions:
@@ -131,6 +136,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - uses: actions/download-artifact@v4
         with:
@@ -158,6 +165,7 @@ jobs:
           set -euo pipefail
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           sed -e "s|<version>|$VERSION|g" -e "s|<bump-sha>|${SHA:0:8}|g" -e "s|<run-url>|$run_url|g" release-body.md > body.md
+          bash .github/notes-section.sh "$VERSION" >> body.md
           cat body.md
           echo "v$VERSION $SHA $(date -u +%FT%TZ)" >> released.txt
           git config user.name "Black Swan"
@@ -166,3 +174,28 @@ jobs:
           git commit -q -m "record release v$VERSION"
           git push -q origin HEAD
           gh release create "v$VERSION" assets/* --title "Node and qclient $VERSION" --notes-file body.md --latest --target "$(git rev-parse HEAD)"
+
+  notes:
+    needs: detect
+    if: needs.detect.outputs.build == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: add or update the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -s "notes/$VERSION.md" ] || { echo "no notes/$VERSION.md"; exit 0; }
+          gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" --json body --jq .body > old.md
+          awk '/^<!-- notes -->$/ {exit} {print}' old.md | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > new.md
+          bash .github/notes-section.sh "$VERSION" >> new.md
+          if cmp -s <(sed -e '$a\' old.md) <(sed -e '$a\' new.md); then echo "notes already current"; exit 0; fi
+          gh release edit "v$VERSION" -R "$GITHUB_REPOSITORY" --notes-file new.md
+          echo "notes added to v$VERSION"
