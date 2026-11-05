@@ -5,20 +5,37 @@ name: release-binaries
 # version yet, build node and qclient at that commit with the project's
 # node/build.sh and publish them as the latest release. notes/<version>.md,
 # when present, is appended to that version's release (at publication, or
-# by the notes job once it lands).
+# by the notes job once it lands). A dispatch with dry_run builds and
+# uploads the binaries as run artifacts and publishes nothing.
 on:
   schedule:
     - cron: '*/15 * * * *'
   push:
     branches: [main]
     paths: ['notes/**']
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload artifacts only; create or edit no release or notes
+        type: boolean
+        default: false
+      sha:
+        description: Upstream commit to build (dry runs only; default the newest bump)
+        type: string
+        default: ''
+      save_cache:
+        description: Save the dependency cache from this branch too (main always saves)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# Publishing runs queue behind each other. A dry run publishes nothing,
+# so it gets its own group: it never delays or replaces a pending
+# publishing run.
 concurrency:
-  group: release-binaries
+  group: ${{ inputs.dry_run && format('release-binaries-dry-{0}', github.ref) || 'release-binaries' }}
   cancel-in-progress: false
 
 env:
@@ -28,35 +45,51 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # mode: release (build and publish), notes (already released: update
+  # its notes) or dry (build only).
   detect:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.d.outputs.sha }}
       version: ${{ steps.d.outputs.version }}
-      build: ${{ steps.d.outputs.build }}
+      mode: ${{ steps.d.outputs.mode }}
     steps:
       - id: d
         env:
           GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SHA_INPUT: ${{ inputs.sha }}
         run: |
           set -euo pipefail
-          sha=$(gh api "repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&path=subpatch&per_page=1" --jq '.[0].sha')
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit changing subpatch on $UPSTREAM_BRANCH (got '$sha')"; exit 1; }
+          dry=false; [ "$DRY_RUN" = true ] && dry=true
+          if [ "$dry" = false ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::only main publishes; dispatch from $GITHUB_REF with dry_run"; exit 1
+          fi
+          if [ -n "$SHA_INPUT" ]; then
+            [ "$dry" = true ] || { echo "::error::sha needs dry_run: a release builds only the newest bump"; exit 1; }
+            [[ "$SHA_INPUT" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::sha '$SHA_INPUT' is not a commit hash"; exit 1; }
+            sha=$(gh api "repos/$UPSTREAM/commits/$SHA_INPUT" --jq .sha)
+          else
+            sha=$(gh api "repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&path=subpatch&per_page=1" --jq '.[0].sha')
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit to build on $UPSTREAM_BRANCH (got '$sha')"; exit 1; }
           raw() { gh api -H 'Accept: application/vnd.github.raw' "repos/$UPSTREAM/contents/$1?ref=$sha"; }
           sub=$(raw subpatch | tr -d '[:space:]')
           base=$(raw crates/quil-config/src/version.rs | sed -n 's/^pub const VERSION_STRING: &str = "\(.*\)";/\1/p')
           [[ "$sub" =~ ^[0-9]+$ && "$base" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::cannot parse version at $sha: base='$base' subpatch='$sub'"; exit 1; }
           v="$base.$sub"
           { echo "sha=$sha"; echo "version=$v"; } >> "$GITHUB_OUTPUT"
-          if gh release view "v$v" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "build=false" >> "$GITHUB_OUTPUT"; echo "v$v already released"
+          if [ "$dry" = true ]; then
+            echo "mode=dry" >> "$GITHUB_OUTPUT"; echo "dry run: build v$v at $sha, publish nothing"
+          elif gh release view "v$v" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "mode=notes" >> "$GITHUB_OUTPUT"; echo "v$v already released"
           else
-            echo "build=true" >> "$GITHUB_OUTPUT"; echo "new release v$v at $sha"
+            echo "mode=release" >> "$GITHUB_OUTPUT"; echo "new release v$v at $sha"
           fi
 
   build:
     needs: detect
-    if: needs.detect.outputs.build == 'true'
+    if: needs.detect.outputs.mode == 'release' || needs.detect.outputs.mode == 'dry'
     name: ${{ matrix.bin }} (${{ matrix.name }})
     strategy:
       fail-fast: false
@@ -64,8 +97,9 @@ jobs:
         name: [linux-amd64, darwin-arm64]
         bin: [node, qclient]
         include:
+          # Pinned: binaries built on a newer image need its newer glibc.
           - name: linux-amd64
-            runs-on: ubuntu-latest
+            runs-on: ubuntu-24.04
             quil_platform: amd64_linux
           - name: darwin-arm64
             runs-on: macos-14
@@ -80,7 +114,7 @@ jobs:
             out_base: crates/quil-client/build
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ needs.detect.outputs.sha }}
@@ -95,7 +129,42 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
           cache: false
+
+      # Dependency build scripts also run cmake (aws-lc-sys) and libclang
+      # (bindgen, for librocksdb-sys); neither cargo nor the native key
+      # fingerprints them, so a new version of either starts a new cache.
+      - id: tools
+        name: fingerprint build tools
+        run: |
+          set -euo pipefail
+          tools="$ImageOS $(cmake --version | sed -n 1p) $(clang --version | sed -n 1p)"
+          echo "$tools"
+          echo "key=$(printf '%s' "$tools" | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # Restores compiled dependencies only: before saving, the action
+      # deletes the artifacts of every crate inside the checkout, so the
+      # project's own code, and the native libraries it links, is built
+      # from the checkout each time. Cargo reuses a dependency only when
+      # its fingerprint (source checksum, rustc, profile, features,
+      # flags, target) matches. The action adds rustc's version, the
+      # CARGO*/CC*/CFLAGS*/CXX*/CMAKE*/RUST* variables and a hash of
+      # Cargo.lock's external packages, the manifests without versions,
+      # rust-toolchain.toml and .cargo/config.toml to the key, so a
+      # subpatch bump keeps it. The shared key adds the platform, the
+      # binary (each resolves its own features) and the native
+      # libraries, C++ compiler and build tools that C dependencies build
+      # with.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.name }}-${{ matrix.bin }}-native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}-tools-${{ steps.tools.outputs.key }}
+          cache-bin: false
+          # No cache-on-failure: an exact key hit is never saved again,
+          # so a failed or cancelled build's partial set would stay.
+          # Main saves. A branch saves only on request (to measure a
+          # warm build); its entries are visible to that branch alone.
+          save-if: ${{ github.ref == 'refs/heads/main' || inputs.save_cache == true }}
 
       - name: build release ${{ matrix.bin }} binary
         env:
@@ -123,7 +192,7 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then shasum -a 256 "$a" > "$a.sha256"; else sha256sum "$a" > "$a.sha256"; fi
           cat "$a.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.bin }}-${{ matrix.name }}
           path: out/
@@ -131,15 +200,16 @@ jobs:
 
   release:
     needs: [detect, build]
-    runs-on: ubuntu-latest
+    if: needs.detect.outputs.mode == 'release'
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: assets
           merge-multiple: true
@@ -153,8 +223,9 @@ jobs:
           for b in node qclient; do for p in linux-amd64 darwin-arm64; do
             test -s "$b-$VERSION-$p" && test -s "$b-$VERSION-$p.sha256"
           done; done
-          [ "$(ls | wc -l)" = 8 ] || { ls -l; echo "::error::expected 8 assets"; exit 1; }
-          sha256sum -c *.sha256
+          files=(*)
+          [ "${#files[@]}" = 8 ] || { ls -l; echo "::error::expected 8 assets"; exit 1; }
+          sha256sum -c -- *.sha256
 
       - name: publish
         env:
@@ -182,12 +253,12 @@ jobs:
 
   notes:
     needs: detect
-    if: needs.detect.outputs.build == 'false'
-    runs-on: ubuntu-latest
+    if: needs.detect.outputs.mode == 'notes'
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
 
@@ -201,6 +272,8 @@ jobs:
           gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" --json body --jq .body > old.md
           awk '/^<!-- notes -->$/ {exit} {print}' old.md | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > new.md
           bash .github/notes-section.sh "$VERSION" >> new.md
+          # '$a\' is sed's add-a-final-newline command, not a quote escape.
+          # shellcheck disable=SC1003
           if cmp -s <(sed -e '$a\' old.md) <(sed -e '$a\' new.md); then echo "notes already current"; exit 0; fi
           gh release edit "v$VERSION" -R "$GITHUB_REPOSITORY" --notes-file new.md
           echo "notes added to v$VERSION"
