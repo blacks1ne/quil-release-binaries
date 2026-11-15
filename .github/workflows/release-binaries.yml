@@ -1,9 +1,10 @@
 name: release-binaries
 
-# Every 15 minutes: find the newest upstream release-branch commit that
-# changes `subpatch` (the bump); if this repo has no release for its
-# version yet, build node and qclient at that commit with the project's
-# node/build.sh and publish them as the latest release. notes/<version>.md,
+# Every 15 minutes: find the newest commit on upstream's default branch
+# that changes its version (`subpatch` or VERSION_STRING; .github/
+# version.sh); if this repo has no release for that version yet, build
+# node and qclient at that commit with the project's node/build.sh and
+# publish them as the latest release. notes/<version>.md,
 # when present, is appended to that version's release (at publication, or
 # by the notes job once it lands). A dispatch with dry_run builds and
 # uploads the binaries as run artifacts and publishes nothing.
@@ -20,7 +21,7 @@ on:
         type: boolean
         default: false
       sha:
-        description: Upstream commit to build (dry runs only; default the newest bump)
+        description: Upstream commit to build (dry runs only; default the newest version change)
         type: string
         default: ''
       save_cache:
@@ -40,20 +41,28 @@ concurrency:
 
 env:
   UPSTREAM: QuilibriumNetwork/monorepo
-  UPSTREAM_BRANCH: v2.1.0.25
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash .github/test-version.sh
+
   # mode: release (build and publish), notes (already released: update
   # its notes) or dry (build only).
   detect:
+    needs: test
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.d.outputs.sha }}
       version: ${{ steps.d.outputs.version }}
       mode: ${{ steps.d.outputs.mode }}
     steps:
+      - uses: actions/checkout@v5
+
       - id: d
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,14 +79,11 @@ jobs:
             [[ "$SHA_INPUT" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::sha '$SHA_INPUT' is not a commit hash"; exit 1; }
             sha=$(gh api "repos/$UPSTREAM/commits/$SHA_INPUT" --jq .sha)
           else
-            sha=$(gh api "repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&path=subpatch&per_page=1" --jq '.[0].sha')
+            branch=$(gh api "repos/$UPSTREAM" --jq .default_branch)
+            sha=$(bash .github/version.sh pick "$UPSTREAM" "$branch")
           fi
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit to build on $UPSTREAM_BRANCH (got '$sha')"; exit 1; }
-          raw() { gh api -H 'Accept: application/vnd.github.raw' "repos/$UPSTREAM/contents/$1?ref=$sha"; }
-          sub=$(raw subpatch | tr -d '[:space:]')
-          base=$(raw crates/quil-config/src/version.rs | sed -n 's/^pub const VERSION_STRING: &str = "\(.*\)";/\1/p')
-          [[ "$sub" =~ ^[0-9]+$ && "$base" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::cannot parse version at $sha: base='$base' subpatch='$sub'"; exit 1; }
-          v="$base.$sub"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit to build (got '$sha')"; exit 1; }
+          v=$(bash .github/version.sh at "$UPSTREAM" "$sha")
           { echo "sha=$sha"; echo "version=$v"; } >> "$GITHUB_OUTPUT"
           if [ "$dry" = true ]; then
             echo "mode=dry" >> "$GITHUB_OUTPUT"; echo "dry run: build v$v at $sha, publish nothing"
