@@ -8,6 +8,15 @@ name: release-binaries
 # when present, is appended to that version's release (at publication, or
 # by the notes job once it lands). A dispatch with dry_run builds and
 # uploads the binaries as run artifacts and publishes nothing.
+#
+# Each run also reads the official listing (.github/public.sh) and keeps
+# its per-file digests in public.txt. When they change without a new
+# version (the official binaries were rebuilt in place), the run builds
+# the default branch's tip if that is at the listed version (plus any
+# subpatch) and not released yet, as v<version>-<sha8> with the official
+# digests in its notes; upstream names no commit for the official
+# binaries, so this never claims to be them. A tip at another version
+# builds nothing and fails the run once, as the notice.
 on:
   schedule:
     - cron: '*/15 * * * *'
@@ -41,6 +50,7 @@ concurrency:
 
 env:
   UPSTREAM: QuilibriumNetwork/monorepo
+  PUBLIC_BASE: https://releases.quilibrium.com
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
@@ -50,16 +60,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash .github/test-version.sh
+      - run: bash .github/test-public.sh
 
   # mode: release (build and publish), notes (already released: update
-  # its notes) or dry (build only).
+  # its notes), dry (build only), follow (the official listing changed:
+  # build and publish the tip), record (it changed, the tip is already
+  # released: record it) or notice (it changed, no commit maps: record it
+  # and fail). name is the release's version: version, or version-<sha8>
+  # for follow.
   detect:
     needs: test
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.d.outputs.sha }}
       version: ${{ steps.d.outputs.version }}
+      name: ${{ steps.d.outputs.name }}
       mode: ${{ steps.d.outputs.mode }}
+      public: ${{ steps.d.outputs.public }}
+      public_error: ${{ steps.d.outputs.public_error }}
     steps:
       - uses: actions/checkout@v5
 
@@ -84,18 +102,40 @@ jobs:
           fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit to build (got '$sha')"; exit 1; }
           v=$(bash .github/version.sh at "$UPSTREAM" "$sha")
-          { echo "sha=$sha"; echo "version=$v"; } >> "$GITHUB_OUTPUT"
-          if [ "$dry" = true ]; then
-            echo "mode=dry" >> "$GITHUB_OUTPUT"; echo "dry run: build v$v at $sha, publish nothing"
-          elif gh release view "v$v" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "mode=notes" >> "$GITHUB_OUTPUT"; echo "v$v already released"
-          else
-            echo "mode=release" >> "$GITHUB_OUTPUT"; echo "new release v$v at $sha"
+          name=$v
+          # The official listing: a failure to read it never holds a
+          # version release; the public-error job fails the run.
+          pmode=error
+          eof=EOF_$(openssl rand -hex 16)
+          if [ "$dry" = false ]; then
+            if pub=$(bash .github/public.sh detect "$PUBLIC_BASE" public.txt released.txt "$UPSTREAM" "$branch" public.new 2> public.err); then
+              read -r pmode pv tip tv <<< "$pub"
+              echo "official listing: $pub"
+              { echo "public<<$eof"; cat public.new; echo "$eof"; } >> "$GITHUB_OUTPUT"
+            else
+              cat public.err >&2
+              { echo "public_error<<$eof"; cat public.err; echo "$eof"; } >> "$GITHUB_OUTPUT"
+            fi
           fi
+          if [ "$dry" = true ]; then
+            mode=dry; echo "dry run: build v$v at $sha, publish nothing"
+          elif ! gh release view "v$v" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            mode=release; echo "new release v$v at $sha"
+          else
+            case $pmode in
+              follow)
+                sha=$tip; v=$tv; name=$tv-${tip:0:8}; mode=follow
+                echo "official $pv binaries changed: release v$name at $sha" ;;
+              record) mode=record; echo "official $pv binaries changed; tip $tip already released" ;;
+              notice) mode=notice; echo "official $pv binaries changed; tip $tip is at $tv" ;;
+              *) mode=notes; echo "v$v already released" ;;
+            esac
+          fi
+          { echo "sha=$sha"; echo "version=$v"; echo "name=$name"; echo "mode=$mode"; } >> "$GITHUB_OUTPUT"
 
   build:
     needs: detect
-    if: needs.detect.outputs.mode == 'release' || needs.detect.outputs.mode == 'dry'
+    if: contains(fromJSON('["release", "follow", "dry"]'), needs.detect.outputs.mode)
     name: ${{ matrix.bin }} (${{ matrix.name }})
     strategy:
       fail-fast: false
@@ -185,6 +225,7 @@ jobs:
       - name: check and name the asset
         env:
           VERSION: ${{ needs.detect.outputs.version }}
+          NAME: ${{ needs.detect.outputs.name }}
         run: |
           set -euo pipefail
           f=${{ matrix.out_base }}/${{ matrix.quil_platform }}/${{ matrix.bin }}
@@ -192,7 +233,7 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then otool -L "$f"; else ldd "$f" || true; fi
           "$f" --version | tee version.txt
           grep -qF "$VERSION" version.txt || { echo "::error::$f --version does not report $VERSION"; exit 1; }
-          a=${{ matrix.bin }}-$VERSION-${{ matrix.name }}
+          a=${{ matrix.bin }}-$NAME-${{ matrix.name }}
           mkdir -p out && cp "$f" "out/$a"
           cd out
           if [ "$RUNNER_OS" = macOS ]; then shasum -a 256 "$a" > "$a.sha256"; else sha256sum "$a" > "$a.sha256"; fi
@@ -206,7 +247,7 @@ jobs:
 
   release:
     needs: [detect, build]
-    if: needs.detect.outputs.mode == 'release'
+    if: needs.detect.outputs.mode == 'release' || needs.detect.outputs.mode == 'follow'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -222,12 +263,12 @@ jobs:
 
       - name: verify assets
         env:
-          VERSION: ${{ needs.detect.outputs.version }}
+          NAME: ${{ needs.detect.outputs.name }}
         run: |
           set -euo pipefail
           cd assets
           for b in node qclient; do for p in linux-amd64 darwin-arm64; do
-            test -s "$b-$VERSION-$p" && test -s "$b-$VERSION-$p.sha256"
+            test -s "$b-$NAME-$p" && test -s "$b-$NAME-$p.sha256"
           done; done
           files=(*)
           [ "${#files[@]}" = 8 ] || { ls -l; echo "::error::expected 8 assets"; exit 1; }
@@ -237,25 +278,69 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.detect.outputs.version }}
+          NAME: ${{ needs.detect.outputs.name }}
           SHA: ${{ needs.detect.outputs.sha }}
+          MODE: ${{ needs.detect.outputs.mode }}
+          PUBLIC: ${{ needs.detect.outputs.public }}
         run: |
           set -euo pipefail
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          sed -e "s|<version>|$VERSION|g" -e "s|<bump-sha>|${SHA:0:8}|g" -e "s|<run-url>|$run_url|g" release-body.md > body.md
-          bash .github/notes-section.sh "$VERSION" >> body.md
+          tpl=release-body.md
+          [ "$MODE" = release ] || tpl=release-body-public.md
+          sed -e "s|<version>|$NAME|g" -e "s|<bump-sha>|${SHA:0:8}|g" -e "s|<run-url>|$run_url|g" "$tpl" > body.md
+          if [ "$MODE" = release ]; then
+            bash .github/notes-section.sh "$VERSION" >> body.md
+          else
+            { printf '\nThe official listing when this build started (SHA3-256):\n\n'; while IFS= read -r l; do printf '    %s\n' "$l"; done <<< "$PUBLIC"; } >> body.md
+          fi
           cat body.md
-          echo "v$VERSION $SHA $(date -u +%FT%TZ)" >> released.txt
-          git config user.name "Black Swan"
-          git config user.email "q.blacks1ne@gmail.com"
-          git add released.txt
-          git commit -q -m "record release v$VERSION"
+          echo "v$NAME $SHA $(date -u +%FT%TZ)" >> released.txt
+          files=(released.txt)
+          if [ -n "$PUBLIC" ]; then printf '%s\n' "$PUBLIC" > public.txt; files+=(public.txt); fi
           # A notes commit can land on main while the builds run.
-          for i in 1 2 3 4 5; do
-            git push -q origin HEAD && break
-            [ "$i" = 5 ] && { echo "::error::could not push released.txt"; exit 1; }
-            git pull -q --rebase origin main
-          done
-          gh release create "v$VERSION" assets/* --title "Node and qclient $VERSION" --notes-file body.md --latest --target "$(git rev-parse HEAD)"
+          bash .github/record.sh "record release v$NAME" "${files[@]}"
+          gh release create "v$NAME" assets/* --title "Node and qclient $NAME" --notes-file body.md --latest --target "$(git rev-parse HEAD)"
+
+  # The official listing changed and nothing is built: record it so the
+  # next run sees no change; a notice also fails this run, once.
+  record:
+    needs: detect
+    if: needs.detect.outputs.mode == 'record' || needs.detect.outputs.mode == 'notice'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: record the official listing
+        env:
+          MODE: ${{ needs.detect.outputs.mode }}
+          PUBLIC: ${{ needs.detect.outputs.public }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PUBLIC" > public.txt
+          v=$(bash .github/public.sh version public.txt)
+          bash .github/record.sh "record official listing $v" public.txt
+          if [ "$MODE" = notice ]; then
+            echo "::error::the official $v binaries changed, but the default branch's tip is at another version: nothing built (detect's log names the tip)"
+            exit 1
+          fi
+
+  # The official listing could not be read or is malformed: version
+  # releases go on, but the run fails so that it is seen.
+  public-error:
+    needs: detect
+    if: needs.detect.outputs.public_error != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          ERR: ${{ needs.detect.outputs.public_error }}
+        run: |
+          printf '%s\n' "$ERR"
+          echo "::error::the official listing could not be read: changes to it are not followed until it can"
+          exit 1
 
   notes:
     needs: detect
